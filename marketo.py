@@ -12,12 +12,15 @@ class MarketoClient:
         self.client_id = client_id
         self.client_secret = client_secret
         self.api_version = "v1"
+        self._fields = None
 
         self.refresh_auth_token()
 
     def refresh_auth_token(self):
-        auth_url = "%s/oauth/token?grant_type=client_credentials&client_id=%s&client_secret=%s" % (
-            self.identity_endpoint, self.client_id, self.client_secret)
+        auth_url = "%s/oauth/token?grant_type=client_credentials" % (
+            self.identity_endpoint)
+        auth_url += "&client_id=%s&client_secret=%s" % (self.client_id,
+                                                        self.client_secret)
         debug("Calling %s" % auth_url)
         r = requests.get(auth_url)
         r.raise_for_status()
@@ -26,6 +29,16 @@ class MarketoClient:
         log("Access token acquired: %s expiring in %s" %
             (auth_data['access_token'], auth_data['expires_in']))
         self.auth_token = auth_data['access_token']
+
+    @property
+    def fields(self):
+        if self._fields is None:
+            res = "leads/describe.json"
+            fields = self.auth_get(res)["result"]
+            fields = [f["rest"]["name"] for f in fields]
+            self._fields = fields
+
+        return self._fields
 
     def get_paging_token(self, since):
         """
@@ -38,7 +51,7 @@ class MarketoClient:
         data = self.auth_get(resource, params)
         return data["nextPageToken"]
 
-    def get_leadchanges(self, fields, since):
+    def get_leadchanges(self, since, fields):
         """
         Get lead changes.
         Params: fields = ["company", "score", "firstName"]
@@ -68,7 +81,8 @@ class MarketoClient:
 
     def auth_get(self, resource, params=[], page_size=None):
         """
-        Make an authenticated GET to Marketo
+        Make an authenticated GET to Marketo, check success and
+        return dict from json response.
         page_size: page size, max and default 300
         """
 
@@ -89,46 +103,60 @@ class MarketoClient:
         return data
 
 
-class BaseResource(object):
-    RESOURCE = "resources"
+class Lead(object):
 
     def __init__(self, client, id):
         self._client = client
-        self._resource = self.RESOURCE
+        self._resource = "leads.json"
         self.id = id
         self._data_cache = None
-        self.url = None
-        self._fields = None
-
-        if self._resource not in self._client.fields:
-            self._client.load_fields_for_resource(self._resource)
+        self._default_fields = None
 
     def __getattr__(self, name):
+        log("Looking for %s" % name)
+        if name not in self.fields:
+            raise AttributeError
 
-        if self.HAS_CUSTOM_FIELDS and name in self._field_names:
-            attr = self._field_names[name]
-        else:
-            attr = name
-
-        if attr in self._data:
-            value = self._data[attr]
-            return value
+        if name in self._data:
+            return self._data[name]
+        elif name in self.fields:
+            self._load_data(name)
+            return self._data[name]
         else:
             raise AttributeError
 
     @property
+    def fields(self):
+        return self._client.fields
+
+    @property
     def _data(self):
         if self._data_cache is None:
-            resource = "%s/%s.json" % (self.RESOURCE_SEGMENT, self.id)
-            data = self.auth_get(resource)
-            self.url = r.url
-            self._data_cache = data
+            if self._default_fields is not None:
+                self._load_data(self._default_fields)
+            else:
+                self._load_data()
 
         return self._data_cache
 
+    def _load_data(self, fields=None):
+        "Load lead data for fields provided, or use default fields."
+        resource = "leads/%s.json" % (self.id)
 
-class Lead(BaseResource):
-    RESOURCE_SEGMENT = "leads"
+        params = {}
+        if fields is not None:
+            if type(fields) is str:
+                fields = [fields]
+            params = {"fields": ",".join(fields)}
+
+        result = self._client.auth_get(resource, params)["result"][0]
+        if self._data_cache is not None:
+            newdata = self._data_cache.copy()
+            newdata.update(result)
+            self._data_cache = newdata
+        else:
+            self._data_cache = result
+
 
 
 class LeadChangeSet:
