@@ -1,5 +1,6 @@
 import requests
-from util import *
+import logging
+import time
 
 
 class MarketoClient:
@@ -13,6 +14,7 @@ class MarketoClient:
         self.client_secret = client_secret
         self.api_version = "v1"
         self._fields = None
+        self._session = requests.Session()
 
         self.refresh_auth_token()
 
@@ -75,6 +77,21 @@ class MarketoClient:
         data = self.auth_get(resource, params=params)
         return data["result"]
 
+    def query_leads(self, query, return_fields=None):
+        """Query leads by any parameters.
+        query: dict of fields / value to query on
+        return fields: array of which fields should be requested from marketo
+        """
+        resource = "leads.json"
+        params = {
+          "filterType": ",".join(query.keys()),
+          "filterValues": ",".join(query.values())}
+        if return_fields is not None:
+            params["fields"] = return_fields
+
+        data = self.auth_get(resource, params=params)
+        return data["result"]
+
     def build_resource_url(self, resource):
         res_url = "%s/%s/%s" % (self.api_endpoint, self.api_version, resource)
         return res_url
@@ -91,7 +108,7 @@ class MarketoClient:
             params['batchSize'] = page_size
 
         res_url = self.build_resource_url(resource)
-        r = requests.get(res_url, headers=headers, params=params)
+        r = self._session.get(res_url, headers=headers, params=params)
         r.raise_for_status()
         data = r.json()
 
@@ -99,7 +116,7 @@ class MarketoClient:
             err = data["errors"][0]
             raise Exception("Error %s - %s, calling %s" %
                             (err["code"], err["message"], r.url))
-
+        time.sleep(20/80)
         return data
 
 
@@ -231,3 +248,61 @@ class LeadChangeSet:
             for f in c["fields"]:
                 changed_fields[f["name"]] = f["newValue"]
             yield changed_fields
+
+class PagedMarketoResult:
+
+    def __init__(self, client, resource, since, fields, page_size):
+        self.resource = resource
+        self.client = client
+        self.since = since
+        self.fields = fields
+        self.page_size = page_size
+        self.has_more_result = False
+        self.next_page_token = None
+        self.changes = []
+        self.fetch_next_page()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if len(self.changes) == 0 and not self.has_more_result:
+            raise StopIteration
+
+        if len(self.changes) == 0 and self.has_more_result:
+            self.fetch_next_page()
+
+        return self.changes.pop(0)
+
+    def fetch_next_page(self):
+        debug("fetching next page")
+        if self.next_page_token is None:
+            self.next_page_token = self.client.get_paging_token(
+                since=self.since)
+
+        params = {
+            "fields": ','.join(self.fields),
+            "nextPageToken": self.next_page_token}
+
+        data = self.client.auth_get(self.resource, params, self.page_size)
+
+        # If moreResult is true, set flag on object and next page token, if
+        # not, reset them
+        if data["moreResult"]:
+            self.has_more_result = True
+            self.next_page_token = data["nextPageToken"]
+        else:
+            self.has_more_result = False
+            self.next_page_token = None
+
+        for lead in self.prepare_results(data["result"]):
+            self.changes.append(lead)
+
+
+def debug(msg):
+    logger = logging.getLogger(__name__)
+    logger.debug(msg)
+
+def log(msg):
+    logger = logging.getLogger(__name__)
+    logger.info(msg)
