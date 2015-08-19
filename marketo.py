@@ -1,6 +1,7 @@
 import requests
 import logging
 import time
+from .util import *
 
 
 class MarketoClient:
@@ -84,19 +85,37 @@ class MarketoClient:
         """
         resource = "leads.json"
         params = {
-          "filterType": ",".join(query.keys()),
-          "filterValues": ",".join(query.values())}
+            "filterType": ",".join(query.keys()),
+            "filterValues": ",".join(query.values())}
         if return_fields is not None:
             params["fields"] = return_fields
 
         data = self.auth_get(resource, params=params)
         return data["result"]
 
+    def get_activities(self, since, type_ids, listId=None):
+        """query and iterate on activities"""
+        res = "activities.json"
+        params = {
+            "activityTypeIds": type_ids,
+        }
+        params["listId"] = listId or None
+
+        return ActivityResultSet(self, res, since, **params)
+
+    def get_activity_types(self):
+        res = "activities/types.json"
+        data = self.auth_get(res)
+        types = {}
+        for i in data["result"]:
+            types[i["id"]] = i
+        return types
+
     def build_resource_url(self, resource):
         res_url = "%s/%s/%s" % (self.api_endpoint, self.api_version, resource)
         return res_url
 
-    def auth_get(self, resource, params=[], page_size=None):
+    def auth_get(self, resource, params={}, page_size=None):
         """
         Make an authenticated GET to Marketo, check success and
         return dict from json response.
@@ -107,16 +126,27 @@ class MarketoClient:
         if page_size is not None:
             params['batchSize'] = page_size
 
+        # if a param is a list, convert to csv string
+        for k, v in params.items():
+            if type(v) == list:
+                params[k] = ",".join(str(i) for i in v)
+
         res_url = self.build_resource_url(resource)
+
+        time.sleep(20 / 80)
         r = self._session.get(res_url, headers=headers, params=params)
         r.raise_for_status()
         data = r.json()
 
         if data["success"] is False:
             err = data["errors"][0]
-            raise Exception("Error %s - %s, calling %s" %
-                            (err["code"], err["message"], r.url))
-        time.sleep(20/80)
+            if err["code"] in ("601", "602"):
+                debug("Token expired or invalid, fetching new token to replay request")
+                self.refresh_auth_token()
+                return self.auth_get(resource, params=params)
+            else:
+                raise Exception("Error %s - %s, calling %s" %
+                                (err["code"], err["message"], r.url))
         return data
 
 
@@ -173,7 +203,6 @@ class Lead(object):
             self._data_cache = newdata
         else:
             self._data_cache = result
-
 
 
 class LeadChangeSet:
@@ -249,30 +278,34 @@ class LeadChangeSet:
                 changed_fields[f["name"]] = f["newValue"]
             yield changed_fields
 
+
 class PagedMarketoResult:
 
-    def __init__(self, client, resource, since, fields, page_size):
+    def __init__(self, client, resource, since, **kwargs):
         self.resource = resource
         self.client = client
         self.since = since
-        self.fields = fields
-        self.page_size = page_size
         self.has_more_result = False
         self.next_page_token = None
-        self.changes = []
+        self._data = []
+        self._params = {}
+
+        if kwargs:
+            self._params.update(kwargs)
+
         self.fetch_next_page()
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if len(self.changes) == 0 and not self.has_more_result:
+        if not self._data and not self.has_more_result:
             raise StopIteration
 
-        if len(self.changes) == 0 and self.has_more_result:
+        if not self._data and self.has_more_result:
             self.fetch_next_page()
 
-        return self.changes.pop(0)
+        return self._data.pop(0)
 
     def fetch_next_page(self):
         debug("fetching next page")
@@ -280,11 +313,10 @@ class PagedMarketoResult:
             self.next_page_token = self.client.get_paging_token(
                 since=self.since)
 
-        params = {
-            "fields": ','.join(self.fields),
-            "nextPageToken": self.next_page_token}
+        params = self._params
+        params["nextPageToken"] = self.next_page_token
 
-        data = self.client.auth_get(self.resource, params, self.page_size)
+        data = self.client.auth_get(self.resource, params)
 
         # If moreResult is true, set flag on object and next page token, if
         # not, reset them
@@ -295,13 +327,31 @@ class PagedMarketoResult:
             self.has_more_result = False
             self.next_page_token = None
 
-        for lead in self.prepare_results(data["result"]):
-            self.changes.append(lead)
+        self._data = self.prepare_results(data["result"])
+
+    def prepare_results(self, data):
+        return data
+
+
+class ActivityResultSet(PagedMarketoResult):
+    def prepare_results(self, data):
+        activities = []
+        for i in data:
+            if "attributes" in i:
+                i["data"] = {}
+                for attr in i["attributes"]:
+                    i["data"][to_snake_case(attr["name"])] = attr["value"]
+                i.pop("attributes")
+            activities.append(i)
+        return activities
+
+
 
 
 def debug(msg):
     logger = logging.getLogger(__name__)
     logger.debug(msg)
+
 
 def log(msg):
     logger = logging.getLogger(__name__)
