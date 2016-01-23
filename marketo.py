@@ -37,6 +37,7 @@ class MarketoClient:
     def fields(self):
         if self._fields is None:
             res = "leads/describe.json"
+            log("No fields cached, fetching fields definition with %s" % res)
             r = self.auth_get(res)["result"]
             fields = {}
             for f in r:
@@ -117,6 +118,39 @@ class MarketoClient:
         res_url = "%s/%s/%s" % (self.api_endpoint, self.api_version, resource)
         return res_url
 
+
+    def update_lead(self, lead_data):
+        """Update a lead in Marketo"""
+        resource = "leads.json"
+        data = {
+            "action": "updateOnly",
+            "input": [lead_data],
+        }
+
+        self.auth_post(resource, data)
+
+    def auth_post(self, resource, data):
+        """Make a post to a resource in Marketo)"""
+        headers = {"Authorization": "Bearer %s" % self.auth_token}
+
+        res_url = self.build_resource_url(resource)
+        r = self._session.post(res_url, headers=headers, json=data)
+        r.raise_for_status()
+        data = r.json()
+
+        if data["success"] is False:
+            err = data["errors"][0]
+            if err["code"] in ("601", "602"):
+                debug("Token expired or invalid, fetching new token to replay request")
+                self.refresh_auth_token()
+                return self.auth_post(resource, data)
+            else:
+                raise Exception("Error %s - %s, calling %s" %
+                                (err["code"], err["message"], r.url))
+        return
+
+
+
     def auth_get(self, resource, params={}, page_size=None):
         """
         Make an authenticated GET to Marketo, check success and
@@ -135,6 +169,8 @@ class MarketoClient:
 
         res_url = self.build_resource_url(resource)
 
+        #Be nice with Marketo API, don't go faster than allowed
+        #XXX to be improved using a shared last access time counter
         time.sleep(20 / 80)
         r = self._session.get(res_url, headers=headers, params=params)
         r.raise_for_status()
@@ -156,13 +192,19 @@ class Lead(object):
 
     def __init__(self, client, id):
         self._client = client
-        self._resource = "leads.json"
         self.id = id
+        self._resource = "leads/%s.json" % (self.id)
         self._data_cache = None
         self._default_fields = None
+        self._dirty_fields = set()
+
+        self._load_data()
+
+        #mark initial loading as done so setattr can work "magically"
+        self._init_done = True
 
     def __getattr__(self, name):
-        log("Looking for %s" % name)
+        debug("Looking for field %s" % name)
         if name not in self.fields:
             raise AttributeError
 
@@ -173,6 +215,26 @@ class Lead(object):
             return self._data[name]
         else:
             raise AttributeError
+
+    def __setattr__(self, name, value):
+        debug("Setting field %s" % name)
+        if "_init_done" not in self.__dict__ or name in self.__dict__:
+            # use default setattr
+            object.__setattr__(self, name, value)
+            return
+
+        #TODO: check if strategy make sense (or if writing without loading is better)
+        if name in self.fields and not name in self._data:
+            self._load_data(name)
+
+        if name in self.fields:
+            if not unicode(self._data[name]) == unicode(value):
+                self._data[name] = value
+                self._dirty_fields.add(name)
+        else:
+            raise AttributeError("Can't set propery: attribute %s \
+                                          not found." % (name))
+
 
     @property
     def fields(self):
@@ -190,7 +252,6 @@ class Lead(object):
 
     def _load_data(self, fields=None):
         "Load lead data for fields provided, or use default fields."
-        resource = "leads/%s.json" % (self.id)
 
         params = {}
         if fields is not None:
@@ -198,7 +259,7 @@ class Lead(object):
                 fields = [fields]
             params = {"fields": ",".join(fields)}
 
-        result = self._client.auth_get(resource, params)["result"][0]
+        result = self._client.auth_get(self._resource, params)["result"][0]
         if self._data_cache is not None:
             newdata = self._data_cache.copy()
             newdata.update(result)
@@ -206,6 +267,22 @@ class Lead(object):
         else:
             self._data_cache = result
 
+    def save(self):
+        """Write lead to Marketo"""
+
+        if not self._dirty_fields:
+            debug("No dirty fields for object %s" % self.id)
+            return
+
+        debug("Saving dirty fields: %s" % self._dirty_fields)
+        data_for_update = {"email": self.email}
+        for field in self._dirty_fields:
+            data_for_update[field] = self._data[field]
+
+        self._client.update_lead(data_for_update)
+
+        self._dirty_fields.clear()
+        self._data.clear()
 
 
 class PagedMarketoResult:
@@ -236,6 +313,9 @@ class PagedMarketoResult:
             self.fetch_next_page()
 
         return self._data.pop(0)
+
+    #Python 2 compatibility
+    next = __next__
 
     def fetch_next_page(self):
         debug("fetching next page for %s" % self.RESOURCE)
