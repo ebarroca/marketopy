@@ -37,8 +37,10 @@ class MarketoClient:
     def fields(self):
         if self._fields is None:
             res = "leads/describe.json"
-            fields = self.auth_get(res)["result"]
-            fields = [f["rest"]["name"] for f in fields]
+            r = self.auth_get(res)["result"]
+            fields = {}
+            for f in r:
+                fields[f["rest"]["name"]] = f["dataType"]
             self._fields = fields
 
         return self._fields
@@ -59,7 +61,7 @@ class MarketoClient:
         Get lead changes.
         Params: fields = ["company", "score", "firstName"]
         """
-        return LeadChangeSet(self, since, fields, page_size=300)
+        return LeadChangeSet(self, since, fields=fields, page_size=300)
 
     def get_lead_by_id(self, id, fields=None):
         """Get a lead by its ID"""
@@ -95,13 +97,13 @@ class MarketoClient:
 
     def get_activities(self, since, type_ids, listId=None):
         """query and iterate on activities"""
-        res = "activities.json"
+
         params = {
             "activityTypeIds": type_ids,
         }
         params["listId"] = listId or None
 
-        return ActivityResultSet(self, res, since, **params)
+        return ActivityResultSet(self, since, **params)
 
     def get_activity_types(self):
         res = "activities/types.json"
@@ -205,84 +207,12 @@ class Lead(object):
             self._data_cache = result
 
 
-class LeadChangeSet:
-
-    """
-    REST Resource: activities/leadchanges.json
-    Represent a set of changed leads, only taking into account changed leads,
-    not new leads.
-    TODO: handle new leads
-    """
-
-    def __init__(self, client, since, fields, page_size):
-        self.resource = "activities/leadchanges.json"
-        self.client = client
-        self.since = since
-        self.fields = fields
-        self.page_size = page_size
-        self.has_more_result = False
-        self.next_page_token = None
-        self.changes = []
-        self.fetch_next_page()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if len(self.changes) == 0 and not self.has_more_result:
-            raise StopIteration
-
-        if len(self.changes) == 0 and self.has_more_result:
-            self.fetch_next_page()
-
-        return self.changes.pop(0)
-
-    def fetch_next_page(self):
-        debug("[mkto] Fetching next page for LeadChangeSet")
-        if self.next_page_token is None:
-            self.next_page_token = self.client.get_paging_token(
-                since=self.since)
-
-        params = {
-            "fields": ','.join(self.fields),
-            "nextPageToken": self.next_page_token}
-
-        data = self.client.auth_get(self.resource, params, self.page_size)
-
-        # If moreResult is true, set flag on object and next page token, if
-        # not, reset them
-        if data["moreResult"]:
-            self.has_more_result = True
-            self.next_page_token = data["nextPageToken"]
-        else:
-            self.has_more_result = False
-            self.next_page_token = None
-
-        for lead in self.prepare_results(data["result"]):
-            self.changes.append(lead)
-
-    def prepare_results(self, results):
-        """
-        Iterates over change results and output an
-        array with changed fields and values
-        """
-        for c in results:
-            changed_fields = {}
-            changed_fields["id"] = c['leadId']
-
-            # if no fields updated -> new lead -> skip
-            if len(c["fields"]) == 0:
-                continue
-
-            for f in c["fields"]:
-                changed_fields[f["name"]] = f["newValue"]
-            yield changed_fields
-
 
 class PagedMarketoResult:
 
-    def __init__(self, client, resource, since, **kwargs):
-        self.resource = resource
+    RESOURCE = "define resource"
+
+    def __init__(self, client, since, **kwargs):
         self.client = client
         self.since = since
         self.has_more_result = False
@@ -308,7 +238,7 @@ class PagedMarketoResult:
         return self._data.pop(0)
 
     def fetch_next_page(self):
-        debug("fetching next page")
+        debug("fetching next page for %s" % self.RESOURCE)
         if self.next_page_token is None:
             self.next_page_token = self.client.get_paging_token(
                 since=self.since)
@@ -316,7 +246,7 @@ class PagedMarketoResult:
         params = self._params
         params["nextPageToken"] = self.next_page_token
 
-        data = self.client.auth_get(self.resource, params)
+        data = self.client.auth_get(self.RESOURCE, params)
 
         # If moreResult is true, set flag on object and next page token, if
         # not, reset them
@@ -333,7 +263,43 @@ class PagedMarketoResult:
         return data
 
 
+class LeadChangeSet(PagedMarketoResult):
+
+    """
+    REST Resource: activities/leadchanges.json
+    Represent a set of changed leads, only taking into account changed leads,
+    not new leads.
+    TODO: handle new leads
+    """
+
+    RESOURCE = "activities/leadchanges.json"
+
+    def prepare_results(self, results):
+        """
+        Iterates over change results and output an
+        array with changed fields and values
+        """
+        changes = []
+        for c in results:
+            changed_fields = {}
+            changed_fields["id"] = c['leadId']
+
+            # if no fields updated -> new lead -> skip
+            if len(c["fields"]) == 0:
+                continue
+
+            for f in c["fields"]:
+                changed_fields[f["name"]] = f["newValue"]
+
+            changes.append(changed_fields)
+
+        return changes
+
+
 class ActivityResultSet(PagedMarketoResult):
+
+    RESOURCE = "activities.json"
+
     def prepare_results(self, data):
         activities = []
         for i in data:
@@ -344,15 +310,3 @@ class ActivityResultSet(PagedMarketoResult):
                 i.pop("attributes")
             activities.append(i)
         return activities
-
-
-
-
-def debug(msg):
-    logger = logging.getLogger(__name__)
-    logger.debug(msg)
-
-
-def log(msg):
-    logger = logging.getLogger(__name__)
-    logger.info(msg)

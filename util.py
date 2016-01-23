@@ -5,8 +5,13 @@ import logging
 
 
 def debug(msg):
-    logger = logging.getLogger("pypedrive")
+    logger = logging.getLogger(__name__)
     logger.debug(msg)
+
+
+def log(msg):
+    logger = logging.getLogger(__name__)
+    logger.info(msg)
 
 
 def to_snake_case(label):
