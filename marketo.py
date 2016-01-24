@@ -81,6 +81,15 @@ class MarketoClient:
         data = self.auth_get(resource, params=params)
         return data["result"]
 
+    def get_lead_by_email(self, email):
+        """Query and return lead by email"""
+        query = {"email": email}
+        res = self.query_leads(query, return_fields=["id"])
+        if len(res) == 0:
+            return None
+        else:
+            return Lead(self, res[0]["id"])
+
     def query_leads(self, query, return_fields=None):
         """Query leads by any parameters.
         query: dict of fields / value to query on
